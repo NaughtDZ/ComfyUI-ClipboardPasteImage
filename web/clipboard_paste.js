@@ -7,6 +7,10 @@
 //
 // 图片经 /clipboard_image/store 上传到后端内存，只回一个 key，
 // 不会写进 ComfyUI 的 input 目录。
+//
+// 预览优先用 DOM widget（addDOMWidget）：Nodes 2.0 / Vue 节点渲染下
+// onDrawBackground 不会被调用，只有 DOM 元素才显示得出来。没有
+// addDOMWidget 的旧前端才退回 canvas 绘制。
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
@@ -15,8 +19,12 @@ const NODE_NAME = "ClipboardPasteImage";
 const EXT_NAME = "ClipboardPaste.Image";
 const API_BASE = "/clipboard_image";
 
-const MIN_HEIGHT = 420;
 const MIN_WIDTH = 340;
+const MIN_HEIGHT = 460;
+const PREVIEW_HEIGHT = 240;
+
+const HINT_EMPTY = "在节点上按 Ctrl+V 粘贴图片";
+const HINT_BROKEN = "缓存已失效（ComfyUI 重启会清空内存），请重新粘贴";
 
 function apiUrl(path) {
   return typeof api.apiURL === "function" ? api.apiURL(path) : path;
@@ -40,6 +48,10 @@ function stateOf(node) {
     node.__clipboardPaste = {
       keyWidget: null,
       button: null,
+      domWidget: null,
+      domImg: null,
+      domHint: null,
+      domMeta: null,
       key: "",
       img: null,
       w: 0,
@@ -53,35 +65,138 @@ function stateOf(node) {
 }
 
 function redraw(node) {
-  node.setDirtyCanvas(true, true);
+  // DOM 预览跟 canvas 无关；只有旧前端的 canvas fallback 需要它
+  if (typeof node.setDirtyCanvas === "function") {
+    node.setDirtyCanvas(true, true);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// 预览图加载
+// 预览：DOM widget 优先，canvas 兜底
 // ---------------------------------------------------------------------------
+function ensurePreviewWidget(node) {
+  const st = stateOf(node);
+  if (st.domWidget) return st.domWidget;
+  if (typeof node.addDOMWidget !== "function") return null;
+
+  const wrap = document.createElement("div");
+  wrap.style.cssText = [
+    "position:relative",
+    "width:100%",
+    "height:100%",
+    "box-sizing:border-box",
+    "display:flex",
+    "align-items:center",
+    "justify-content:center",
+    "overflow:hidden",
+    "border-radius:6px",
+    "background:#1e1e1e",
+  ].join(";");
+
+  const img = document.createElement("img");
+  img.alt = "";
+  img.style.cssText =
+    "max-width:100%;max-height:100%;object-fit:contain;display:none;pointer-events:none;";
+  wrap.appendChild(img);
+
+  const hint = document.createElement("span");
+  hint.textContent = HINT_EMPTY;
+  hint.style.cssText = [
+    "position:absolute",
+    "padding:0 12px",
+    "text-align:center",
+    "font:12px system-ui,-apple-system,sans-serif",
+    "color:#7a7a7a",
+    "pointer-events:none",
+  ].join(";");
+  wrap.appendChild(hint);
+
+  const meta = document.createElement("span");
+  meta.style.cssText = [
+    "position:absolute",
+    "left:8px",
+    "bottom:4px",
+    "font:11px system-ui,-apple-system,sans-serif",
+    "color:#8ab4c9",
+    "pointer-events:none",
+  ].join(";");
+  wrap.appendChild(meta);
+
+  let widget = null;
+  try {
+    widget = node.addDOMWidget("clipboard_preview", "div", wrap, {
+      serialize: false,
+      hideOnZoom: false,
+      getValue: () => "",
+      setValue: () => {},
+      getMinHeight: () => PREVIEW_HEIGHT,
+      getMaxHeight: () => PREVIEW_HEIGHT,
+    });
+  } catch (e) {
+    console.warn("[ClipboardPaste] addDOMWidget 失败，退回 canvas 绘制:", e);
+    return null;
+  }
+  if (!widget) return null;
+
+  widget.serialize = false;
+  widget.computeSize = (width) => [width, PREVIEW_HEIGHT];
+  widget.computedHeight = PREVIEW_HEIGHT;
+  wrap.style.minHeight = `${PREVIEW_HEIGHT - 8}px`;
+
+  st.domWidget = widget;
+  st.domImg = img;
+  st.domHint = hint;
+  st.domMeta = meta;
+  return widget;
+}
+
+function syncPreview(node) {
+  const st = stateOf(node);
+  if (st.domImg && st.domHint) {
+    if (st.img && st.img.src) {
+      if (st.domImg.getAttribute("src") !== st.img.src) {
+        st.domImg.src = st.img.src;
+      }
+      st.domImg.style.display = "block";
+      st.domHint.style.display = "none";
+    } else {
+      st.domImg.style.display = "none";
+      st.domHint.style.display = "block";
+      st.domHint.textContent = st.status || HINT_EMPTY;
+      st.domHint.style.color = st.broken ? "#d08d4a" : "#7a7a7a";
+    }
+  }
+  if (st.domMeta) {
+    st.domMeta.textContent = st.w ? `${st.w} × ${st.h} · 仅存内存，不写 input` : "";
+  }
+  redraw(node);
+}
+
 function loadPreview(node, key) {
   const st = stateOf(node);
   st.img = null;
   st.broken = false;
+
   if (!key) {
-    st.status = "在节点上按 Ctrl+V 粘贴图片";
-    redraw(node);
+    st.status = HINT_EMPTY;
+    syncPreview(node);
     return;
   }
+
   const img = new Image();
   img.onload = () => {
     st.img = img;
-    st.status = "";
-    st.broken = false;
     st.w = img.naturalWidth;
     st.h = img.naturalHeight;
-    redraw(node);
+    st.status = "";
+    st.broken = false;
+    syncPreview(node);
   };
   img.onerror = () => {
     st.img = null;
     st.broken = true;
-    st.status = "缓存已失效（ComfyUI 重启会清空内存），请重新粘贴";
-    redraw(node);
+    st.status = HINT_BROKEN;
+    syncPreview(node);
   };
   img.src = apiUrl(`${API_BASE}/preview/${encodeURIComponent(key)}`);
 }
@@ -157,15 +272,17 @@ async function storeBlob(node, blob) {
   if (st.busy) return;
   st.busy = true;
   st.status = "上传中…";
-  redraw(node);
+  st.broken = false;
+  syncPreview(node);
   try {
     applyResult(node, await uploadBlob(blob));
   } catch (e) {
     st.status = `上传失败：${e?.message || e}`;
+    st.broken = true;
+    syncPreview(node);
     toast("error", "粘贴剪贴板图片失败", String(e?.message || e));
   } finally {
     st.busy = false;
-    redraw(node);
   }
 }
 
@@ -174,7 +291,8 @@ async function pasteFromButton(node) {
   if (st.busy) return;
   st.busy = true;
   st.status = "读取剪贴板…";
-  redraw(node);
+  st.broken = false;
+  syncPreview(node);
   try {
     let blob = null;
     let browserError = null;
@@ -195,10 +313,11 @@ async function pasteFromButton(node) {
     }
   } catch (e) {
     st.status = `粘贴失败：${e?.message || e}`;
+    st.broken = true;
+    syncPreview(node);
     toast("error", "粘贴剪贴板图片失败", String(e?.message || e));
   } finally {
     st.busy = false;
-    redraw(node);
   }
 }
 
@@ -221,17 +340,20 @@ function setupNode(node) {
     pasteFromButton(node);
   });
 
+  ensurePreviewWidget(node);
+
   const width = Math.max(node.size[0], MIN_WIDTH);
   const height = Math.max(node.size[1], MIN_HEIGHT);
   node.setSize([width, height]);
+  syncPreview(node);
 }
 
 function restoreFromWorkflow(node) {
   const st = stateOf(node);
   const key = (st.keyWidget?.value || "").trim();
   if (!key) {
-    st.status = "在节点上按 Ctrl+V 粘贴图片";
-    redraw(node);
+    st.status = HINT_EMPTY;
+    syncPreview(node);
     return;
   }
   st.key = key;
@@ -239,7 +361,7 @@ function restoreFromWorkflow(node) {
 }
 
 // ---------------------------------------------------------------------------
-// 绘制缩略图
+// canvas 兜底（只有旧前端、没有 addDOMWidget 时才会画）
 // ---------------------------------------------------------------------------
 function widgetBottom(node) {
   let y = typeof node.widgets_start_y === "number" ? node.widgets_start_y : 30;
@@ -262,7 +384,7 @@ function roundRect(ctx, x, y, w, h, r) {
 
 function drawPreview(node, ctx) {
   const st = node.__clipboardPaste;
-  if (!st || node.flags?.collapsed) return;
+  if (!st || st.domWidget || node.flags?.collapsed) return;
 
   const margin = 10;
   const top = widgetBottom(node) + 6;
@@ -292,7 +414,7 @@ function drawPreview(node, ctx) {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(
-      st.status || "在节点上按 Ctrl+V 粘贴",
+      st.status || HINT_EMPTY,
       margin + availW / 2,
       top + availH / 2,
       availW - 12,
@@ -398,16 +520,18 @@ app.registerExtension({
           const st = stateOf(self);
           st.busy = true;
           st.status = "读取系统剪贴板…";
-          redraw(self);
+          st.broken = false;
+          syncPreview(self);
           grabServerClipboard()
             .then((data) => applyResult(self, data))
             .catch((e) => {
               st.status = `读取失败：${e?.message || e}`;
+              st.broken = true;
+              syncPreview(self);
               toast("error", "读取系统剪贴板失败", String(e?.message || e));
             })
             .finally(() => {
               st.busy = false;
-              redraw(self);
             });
         },
       });

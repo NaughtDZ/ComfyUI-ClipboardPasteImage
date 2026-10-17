@@ -135,9 +135,11 @@ THUMB_MAX_SIDE = 640                 # 节点缩略图最长边
 
 `Ctrl+V` 和节点按钮（浏览器剪贴板通道）可以，读的是你当前设备的剪贴板。`read_system_clipboard` 自动模式读的是**服务端**机器的剪贴板，跨机器时不要用。
 
-**Q：节点上的缩略图或那个隐藏控件显示不正常？**
+**Q：Nodes 2.0（Vue 节点渲染）下能预览吗？**
 
-缩略图是用 canvas 画的。ComfyUI 新版的 **Nodes 2.0（Vue 节点渲染）** 下绘制可能不生效，`image_key` 也可能露出来，但这只影响外观——粘贴、执行、输出都正常。介意的话在设置里切回经典节点渲染。
+能。预览用的是 **DOM widget**（`addDOMWidget`），不是 canvas 绘制，所以经典渲染和 Nodes 2.0 下都能显示图片和尺寸。
+
+早期版本用 `onDrawBackground` 在 canvas 上画缩略图，打开 Nodes 2.0 后该钩子不再被调用，于是看不到预览——现在已改为 DOM widget 优先，只有不支持 `addDOMWidget` 的老前端才退回 canvas。
 
 **Q：能保存成文件吗？**
 
